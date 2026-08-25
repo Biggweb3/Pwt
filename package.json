@@ -1,0 +1,17 @@
+{
+  "name": "polymarket-intel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Polymarket Wallet Intelligence Dashboard — monitor and compare public Polymarket traders from one terminal.",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "build": "npm --prefix client run build",
+    "dev:client": "npm --prefix client run dev"
+  },
+  "dependencies": {
+    "express": "^5.2.0"
+  }
+}
