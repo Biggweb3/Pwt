@@ -15,6 +15,10 @@ import { transportGet, qs } from './transport.js';
 
 export const api = express.Router();
 api.use(express.json({ limit: '8mb' }));
+// Also accept classic form-encoded bodies (application/x-www-form-urlencoded).
+// Standard Express middleware; lets plain HTML forms / simple scripts drive
+// the API without a JSON content-type (no functional difference otherwise).
+api.use(express.urlencoded({ extended: false }));
 
 const walletView = (w) => ({
   address: w.id,
