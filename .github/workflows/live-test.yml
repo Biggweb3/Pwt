@@ -1,0 +1,31 @@
+name: Live site test
+
+# Exercises the PRODUCTION Vercel deployment end to end: checks the API is
+# live (not 404), adds a real trader from Polymarket's public leaderboard,
+# verifies the data pipeline, then removes the trader again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      live_url:
+        description: "Live deployment base URL (no trailing slash)"
+        required: true
+        default: "https://polyintel-theweb3profs-projects.vercel.app"
+      keep:
+        description: "Keep the test trader tracked after the test"
+        type: boolean
+        default: false
+
+jobs:
+  live-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install (server deps only)
+        run: npm install --no-audit --no-fund
+      - name: Run live E2E
+        run: node scripts/e2e-live.mjs "${{ inputs.live_url }}" ${{ inputs.keep && '--keep' || '' }}

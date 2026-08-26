@@ -49,11 +49,13 @@ export default function App() {
             </div>
 
             {/* upstream mode */}
-            <div title={system?.upstreamOk
-              ? 'Server is polling Polymarket directly.'
-              : 'Server cannot reach Polymarket from this host — public reads are relayed through your browser and ingested server-side.'}
-              className={`hidden lg:block text-2xs px-2 py-1 rounded border font-semibold tracking-wider ${system?.upstreamOk ? 'border-gain/30 text-gain bg-gain/5' : 'border-warn/40 text-warn bg-warn/5'}`}>
-              {system == null ? '…' : system.upstreamOk ? 'SERVER SYNC' : 'BRIDGE SYNC'}
+            <div title={system?.deployment === 'serverless'
+              ? 'Serverless deployment: the dashboard API runs as a Vercel function and syncs Polymarket on demand — no always-on server needed.'
+              : system?.upstreamOk
+                ? 'Server is polling Polymarket directly.'
+                : 'Server cannot reach Polymarket from this host — public reads are relayed through your browser and ingested server-side.'}
+              className={`hidden lg:block text-2xs px-2 py-1 rounded border font-semibold tracking-wider ${system?.deployment === 'serverless' ? 'border-accent/30 text-accent bg-accent/5' : system?.upstreamOk ? 'border-gain/30 text-gain bg-gain/5' : 'border-warn/40 text-warn bg-warn/5'}`}>
+              {system == null ? '…' : system.deployment === 'serverless' ? 'SERVERLESS SYNC' : system.upstreamOk ? 'SERVER SYNC' : 'BRIDGE SYNC'}
             </div>
 
             <button onClick={() => setAlertsOpen(true)} className="relative px-2 py-1.5 rounded border border-line bg-ink-850 hover:bg-ink-700 text-slate-300" title="Alerts & notifications">

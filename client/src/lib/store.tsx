@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch, connectEvents, postJson, startBridgeWorker } from './api';
+import { loadTracked, saveTracked, untrackLocal } from './tracked';
 import type { FeedItem, Notification, SystemInfo, Wallet } from './types';
 
 interface Toast { id: number; message: string; kind: string }
@@ -82,7 +83,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // ---- SSE live updates -------------------------------------------------
+  // Serverless deployments cannot hold SSE streams open (and the platform
+  // would bill a function invocation per reconnect), so we only connect when
+  // the server reports a classic long-lived deployment.
+  const deployment = system?.deployment;
   useEffect(() => {
+    if (deployment === 'serverless') return; // polling loop below drives refreshes
+    if (deployment !== 'server') return;     // wait for /api/system before connecting
     const close = connectEvents({
       'wallet:update': () => debouncedWallets(),
       'trades:new': () => { debouncedWallets(); debouncedFeed(); },
@@ -95,7 +102,60 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       system: (data) => setSystem((prev) => ({ ...(prev as SystemInfo), ...(data as SystemInfo) })),
     });
     return close;
-  }, [debouncedWallets, debouncedFeed, pushToast]);
+  }, [deployment, debouncedWallets, debouncedFeed, pushToast]);
+
+  // ---- serverless sync driver --------------------------------------------
+  // Replaces the server's background sync engine: ask the API to bring due
+  // wallets up to date, then re-read everything. Budgeted server-side.
+  useEffect(() => {
+    if (deployment !== 'serverless') return;
+    let stopped = false;
+    const tick = async () => {
+      try { await postJson('/api/sync', {}); } catch { /* transient */ }
+      if (stopped) return;
+      refreshWallets();
+      refreshFeed();
+    };
+    const t = setInterval(tick, 20000);
+    const warm = setTimeout(tick, 1500); // kick a pass shortly after load
+    return () => { stopped = true; clearInterval(t); clearTimeout(warm); };
+  }, [deployment, refreshWallets, refreshFeed]);
+
+  // ---- tracked-wallet memory & serverless auto-reseed --------------------
+  // The browser remembers which traders it tracks. If the serverless API
+  // loses its ephemeral database (cold start), missing wallets are re-added
+  // (one at a time) and fully rebuilt from public Polymarket data.
+  const reseedingRef = useRef<Set<string>>(new Set());
+  const reseedFailsRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    if (!system || walletsLoading) return;
+    const stored = loadTracked();
+    if (system.deployment !== 'serverless') {
+      if (wallets.length || stored.length) saveTracked(wallets.map((w) => w.address));
+      return;
+    }
+    const onServer = new Set(wallets.map((w) => w.address));
+    const missing = stored.filter((a) => !onServer.has(a) && !reseedingRef.current.has(a));
+    if (missing.length) {
+      const address = missing[0];
+      reseedingRef.current.add(address);
+      postJson('/api/wallets', { input: address })
+        .then(() => { reseedFailsRef.current.delete(address); })
+        .catch((err) => {
+          const status = (err as { status?: number })?.status;
+          if (status === 409) return; // another tab seeded it first — fine
+          const fails = (reseedFailsRef.current.get(address) || 0) + 1;
+          reseedFailsRef.current.set(address, fails);
+          if (status === 400 || status === 404 || fails >= 3) untrackLocal(address); // give up quietly
+        })
+        .finally(() => {
+          reseedingRef.current.delete(address);
+          refreshWallets();
+        });
+    } else if (wallets.length) {
+      saveTracked(wallets.map((w) => w.address));
+    }
+  }, [system, wallets, walletsLoading, refreshWallets]);
 
   // ---- initial load ------------------------------------------------------
   useEffect(() => {

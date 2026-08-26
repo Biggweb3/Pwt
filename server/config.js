@@ -1,8 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import fileURLToPathFn from 'node:url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __dirname = path.dirname(fileURLToPathFn.fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 
 // Load .env if present (no dependency needed for a handful of vars)
@@ -18,11 +18,26 @@ try {
 
 const int = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; };
 
+/**
+ * True when running as a Vercel serverless function (Vercel always sets
+ * process.env.VERCEL). In that environment:
+ *  - the filesystem is read-only except /tmp (SQLite lives there)
+ *  - there is no long-lived process, so background pollers/SSE are disabled
+ *    and syncs run inside requests (see routes.js POST /api/sync)
+ */
+export const isServerless = !!process.env.VERCEL;
+
+// Serverless filesystems are read-only outside /tmp.
+const defaultDataDir = isServerless ? '/tmp/pwt-data' : './data';
+const resolveFromRoot = (p) => (path.isAbsolute(p) ? p : path.resolve(root, p));
+const dataDir = resolveFromRoot(process.env.DATA_DIR || defaultDataDir);
+
 export const config = {
   root,
   port: int(process.env.PORT, 3000),
-  dataDir: path.resolve(root, process.env.DATA_DIR || './data'),
-  dbFile: path.resolve(root, process.env.DATA_DIR || './data', 'pwt.db'),
+  dataDir,
+  dbFile: path.join(dataDir, 'pwt.db'),
+  isServerless,
   // Public, documented Polymarket API hosts (see docs.polymarket.com).
   hosts: {
     data: process.env.POLYMARKET_DATA_API || 'https://data-api.polymarket.com',
@@ -42,6 +57,10 @@ export const config = {
   statsRefreshEvery: 10,        // refresh lb-api stats every N cycles
   maxClosedPositions: 1000,     // backfill cap for closed positions
   bridgeJobTimeoutMs: 60000,    // unclaimed bridge jobs expire after this
+  // Overall wall-clock budget for an initial sync when it must complete inside
+  // one request (serverless). Generous history is traded for convergence.
+  serverlessInitialSyncBudgetMs: int(process.env.SERVERLESS_SYNC_BUDGET_MS, 40_000),
+  serverlessSyncBudgetMs: int(process.env.SERVERLESS_SYNC_BUDGET_MS, 40_000),
 };
 
 fs.mkdirSync(config.dataDir, { recursive: true });

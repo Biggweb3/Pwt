@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { apiFetch, ApiError } from '../lib/api';
+import { untrackLocal } from '../lib/tracked';
 import { useStore, useNow } from '../lib/store';
 import { Avatar, Metric, Panel, SideBadge, OutcomeBadge, StatusPill, TypeBadge, UpdatedAgo, Spinner, EmptyState, ErrorState } from '../components/ui';
 import { PerfChart } from '../components/PerfChart';
@@ -50,6 +51,7 @@ export function TraderPage() {
     setRemoving(true);
     try {
       await apiFetch(`/api/wallets/${address}`, { method: 'DELETE' });
+      untrackLocal(address); // stop the browser's auto-reseed from resurrecting it
       refreshWallets();
       nav('/');
     } catch { setRemoving(false); }

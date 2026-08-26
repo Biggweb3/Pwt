@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build + serverless E2E (mock upstream)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
+      - name: Install
+        run: npm install --no-audit --no-fund && npm --prefix client install --no-audit --no-fund
+      - name: Build client
+        run: npm run build
+      - name: Rebuild serverless bundle and verify it is committed up to date
+        run: |
+          npm run build:vercel-api
+          git diff --stat --exit-code -- client/api/index.js || {
+            echo "::error::client/api/index.js is stale. Run 'npm run build:vercel-api' and commit the result."
+            exit 1
+          }
+      - name: E2E — repo-root entrypoint (api/index.js)
+        run: |
+          node scripts/mock-polymarket.mjs 3200 &
+          sleep 1
+          node scripts/e2e-serverless.mjs api/index.js 3301 --mock
+      - name: E2E — prebuilt client-root bundle (client/api/index.js)
+        run: |
+          node scripts/mock-polymarket.mjs 3200 &
+          sleep 1
+          node scripts/e2e-serverless.mjs client/api/index.js 3311 --mock
+
+  e2e-real:
+    name: Serverless E2E (real Polymarket APIs, live leaderboard trader)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
+      - name: Install
+        run: npm install --no-audit --no-fund
+      - name: Add a public trader from the live Polymarket leaderboard and verify the full flow
+        run: node scripts/e2e-serverless.mjs api/index.js 3321
+      - name: Same, against the prebuilt client-root bundle
+        run: node scripts/e2e-serverless.mjs client/api/index.js 3331

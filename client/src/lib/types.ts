@@ -159,6 +159,8 @@ export interface Notification {
 export interface SystemInfo {
   upstreamOk: boolean;
   mode: 'server' | 'bridge';
+  /** 'serverless' when the API runs as a Vercel function (no background sync/SSE). */
+  deployment?: 'server' | 'serverless';
   bridgeJobsPending: number;
   pollInterval: number;
   serverTime: number;
