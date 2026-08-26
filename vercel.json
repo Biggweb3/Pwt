@@ -4,6 +4,11 @@
   "installCommand": "npm install --no-audit --no-fund && npm --prefix client install --no-audit --no-fund",
   "buildCommand": "npm --prefix client run build",
   "outputDirectory": "client/dist",
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60
+    }
+  },
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api" },
     { "source": "/(.*)", "destination": "/index.html" }
