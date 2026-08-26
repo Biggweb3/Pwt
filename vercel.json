@@ -6,12 +6,11 @@
   "outputDirectory": "client/dist",
   "functions": {
     "api/index.js": {
-      "runtime": "nodejs22.x",
       "maxDuration": 60
     }
   },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index" },
-    { "source": "/:path((?!api/).*)", "destination": "/index.html" }
+    { "source": "/api/(.*)", "destination": "/api" },
+    { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
