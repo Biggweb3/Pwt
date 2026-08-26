@@ -9,9 +9,13 @@
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
     "build": "npm --prefix client run build",
-    "dev:client": "npm --prefix client run dev"
+    "dev:client": "npm --prefix client run dev",
+    "build:vercel-api": "node scripts/build-vercel-api.mjs"
   },
   "dependencies": {
     "express": "^5.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.10"
   }
 }

@@ -81,6 +81,45 @@ Node.js server (Express) ── REST API ── SSE hub ── sync engine (per-
    The UI shows a `BRIDGE SYNC` badge and banner when this is active. In a normal
    deployment nothing special is needed — server mode is used automatically.
 
+## Deploying on Vercel
+
+The dashboard ships with **serverless support** so the API runs as a Vercel
+Function next to the static frontend — just import the repo, no extra services
+required. Two deployment shapes are supported automatically:
+
+| Vercel project *Root Directory* | API entrypoint | Notes |
+| --- | --- | --- |
+| repository root (recommended) | `api/index.js` | configured by `./vercel.json` |
+| `client/` | `client/api/index.js` | self-contained bundle, configured by `client/vercel.json` |
+
+Both route `/api/*` to the same Express app used by `npm start`; everything
+else is served from the static Vite build with an SPA fallback.
+
+If you change anything under `server/`, regenerate the client-root bundle with
+`npm run build:vercel-api` (CI fails if the committed bundle is stale).
+
+**Serverless adaptations** (all automatic, detected via `GET /api/system` →
+`deployment: "serverless"`):
+
+- **Storage** — SQLite lives in the function's ephemeral `/tmp`; a cold start
+  starts with a blank database. Your browser remembers the tracked traders and
+  transparently re-seeds + rebuilds them from Polymarket's public APIs, so the
+  dashboard self-heals (watch the `SERVERLESS SYNC` badge). For durable
+  multi-device storage, back `DATA_DIR` with a persistent volume or swap in a
+  hosted database; alert-rule history is the only data not rebuilt.
+- **Syncing** — there is no always-on process, so the browser drives
+  `POST /api/sync` (time-budgeted, idempotent) every ~20 s instead of the
+  background engine; the initial sync after adding a trader runs inline.
+- **Live updates** — SSE is disabled server-side (501); the client polls.
+
+Two Vercel project settings worth checking after the first deploy:
+
+1. **Deployment Protection** (Settings → Deployment Protection): if enabled,
+   your deployment URL requires a Vercel login — fine for personal use, but
+   anonymous visitors (and API clients) get a login wall instead of the app.
+2. **Node.js runtime**: functions are pinned to `nodejs22.x` (`node:sqlite`
+   needs Node ≥ 22.13).
+
 ## Polymarket data sources (verified against docs.polymarket.com + live responses)
 
 | Purpose | Endpoint |
@@ -136,6 +175,11 @@ npm run dev:client       # Vite dev server (port 5173, proxies /api → 3000)
   fixtures; exercise server mode offline:
   `POLYMARKET_DATA_API=http://127.0.0.1:3200 POLYMARKET_GAMMA_API=… POLYMARKET_LB_API=… node server/index.js`
 - `scripts/bridge-sim.mjs` — simulates the browser bridge worker against the same fixtures.
+- `scripts/build-vercel-api.mjs` — bundles the API into `client/api/index.js` for
+  client-root Vercel deployments (`npm run build:vercel-api`).
+- `scripts/e2e-serverless.mjs` — end-to-end test of a serverless entrypoint
+  (`node scripts/e2e-serverless.mjs api/index.js 3300 --mock`, or without `--mock`
+  to add a real trader from the live Polymarket leaderboard).
 
 ## Data integrity rules (enforced by design)
 

@@ -121,9 +121,10 @@ function refreshProfile(wallet, rawProfile) {
 // ---------------------------------------------------------------------------
 // full sync cycle for one wallet
 // ---------------------------------------------------------------------------
-async function runCycle(wallet) {
+async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
   const address = wallet.address;
   const now = nowSec();
+  const outOfTime = () => Date.now() >= deadline;
   updateWallet(wallet.id, { status: 'syncing', last_attempt_at: now });
   broadcast('wallet:update', { walletId: wallet.id, status: 'syncing' });
 
@@ -145,12 +146,13 @@ async function runCycle(wallet) {
         } : null);
       } catch { /* profile is optional; some addresses have none */ }
 
-      // trades backfill (bounded by config)
+      // trades backfill (bounded by config and by the time budget when given)
       const floorTs = now - config.initialHistoryDays * 86400;
       let offset = 0;
       let total = 0;
       let historyComplete = false;
       while (offset < config.initialMaxTrades) {
+        if (outOfTime()) break; // serverless budget: converge now, deepen later via resync
         const page = await execGet(qs(`${D}/trades`, { user: address, limit: 500, offset, takerOnly: true }));
         if (!Array.isArray(page)) break;
         newTrades.push(...ingestTradesRaw(wallet.id, page));
@@ -163,6 +165,7 @@ async function runCycle(wallet) {
 
       // activity backfill (trades + redeems etc.), capped at 1000 rows
       for (const offsetA of [0, 500]) {
+        if (outOfTime()) break;
         const page = await execGet(qs(`${D}/activity`, { user: address, limit: 500, offset: offsetA, sortBy: 'TIMESTAMP', sortDirection: 'DESC' }));
         if (!Array.isArray(page)) break;
         newActivity.push(...ingestActivityRaw(wallet.id, page));
@@ -170,15 +173,17 @@ async function runCycle(wallet) {
       }
 
       // positions snapshot + closed positions
-      const pos = await execGet(qs(`${D}/positions`, { user: address, limit: 500, sortBy: 'CURRENT', sortDirection: 'DESC' }));
-      ingestPositionsRaw(wallet.id, Array.isArray(pos) ? pos : []);
-      let closedOffset = 0;
-      while (closedOffset < config.maxClosedPositions) {
-        const page = await execGet(qs(`${D}/closed-positions`, { user: address, limit: 500, offset: closedOffset }));
-        if (!Array.isArray(page) || !page.length) break;
-        ingestClosedPositionsRaw(wallet.id, page);
-        if (page.length < 500) break;
-        closedOffset += 500;
+      if (!outOfTime()) {
+        const pos = await execGet(qs(`${D}/positions`, { user: address, limit: 500, sortBy: 'CURRENT', sortDirection: 'DESC' }));
+        ingestPositionsRaw(wallet.id, Array.isArray(pos) ? pos : []);
+        let closedOffset = 0;
+        while (closedOffset < config.maxClosedPositions && !outOfTime()) {
+          const page = await execGet(qs(`${D}/closed-positions`, { user: address, limit: 500, offset: closedOffset }));
+          if (!Array.isArray(page) || !page.length) break;
+          ingestClosedPositionsRaw(wallet.id, page);
+          if (page.length < 500) break;
+          closedOffset += 500;
+        }
       }
 
       apiStats = await refreshApiStats(wallet.id, address);
@@ -286,15 +291,47 @@ export function isDue(w, now) {
   return now - last >= effectiveInterval(w);
 }
 
-export async function syncWalletNow(walletId) {
+export async function syncWalletNow(walletId, opts = {}) {
   const w = getWallet(walletId);
   if (!w || syncing.has(walletId)) return null;
   syncing.add(walletId);
   try {
-    return await runCycle(w);
+    const deadline = Number.isFinite(opts.budgetMs) ? Date.now() + opts.budgetMs : undefined;
+    return await runCycle(w, { deadline });
   } finally {
     syncing.delete(walletId);
   }
+}
+
+/**
+ * Request-driven sync pass (serverless mode): synchronously bring due /
+ * unfinished wallets up to date within a wall-clock budget, one at a time.
+ * Returns { synced: [...], remaining } so callers can keep polling.
+ */
+export async function syncDueWallets(budgetMs = config.serverlessSyncBudgetMs) {
+  const deadline = Date.now() + Math.max(2000, budgetMs);
+  const results = [];
+  const now = () => nowSec();
+  const pick = () => {
+    const t = now();
+    return db.prepare('SELECT * FROM wallets ORDER BY added_at ASC').all().filter((w) => {
+      if (syncing.has(w.id)) return false;
+      if (!w.initial_sync_done) return true;
+      // A wallet stuck in 'syncing' (invocation frozen mid-sync) is re-eligible.
+      if (w.status === 'syncing' && t - (w.last_attempt_at || 0) > 120) return true;
+      return isDue(w, t);
+    });
+  };
+  while (Date.now() < deadline - 1500) {
+    const candidates = pick();
+    if (!candidates.length) break;
+    // Finish interrupted initial syncs first, then the oldest due wallet.
+    const w = candidates.find((c) => !c.initial_sync_done) || candidates[0];
+    const remaining = Math.max(1000, deadline - Date.now());
+    const r = await syncWalletNow(w.id, { budgetMs: remaining });
+    results.push({ wallet: w.id, ...(r || { ok: false, error: 'sync already in progress' }) });
+  }
+  return { synced: results, remaining: pick().length };
 }
 
 // ---------------------------------------------------------------------------

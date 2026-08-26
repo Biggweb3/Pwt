@@ -6,7 +6,7 @@ import {
 } from './db.js';
 import * as pm from './polymarketService.js';
 import { computeDashboardStats, windowSummary, pnlSeries, PERIODS, periodCutoff } from './analytics.js';
-import { syncWalletNow } from './syncEngine.js';
+import { syncWalletNow, syncDueWallets } from './syncEngine.js';
 import { sseHandler } from './events.js';
 import { claimJobs, resolveJob, noteBridgeClientSeen, bridgeInUse, pendingJobCount } from './bridge.js';
 import { listRules, addRule, setRuleEnabled, deleteRule } from './alerts.js';
@@ -47,10 +47,26 @@ api.get('/system', async (req, res) => {
   res.json({
     upstreamOk,
     mode: upstreamOk ? 'server' : 'bridge',
+    deployment: config.isServerless ? 'serverless' : 'server',
     bridgeJobsPending: pendingJobCount(),
     pollInterval: parseInt(getSetting('poll_interval', config.defaultPollInterval), 10),
     serverTime: nowSec(),
   });
+});
+
+/**
+ * Request-driven sync pass. On the long-lived server the background engine
+ * already handles this; on serverless (Vercel) the client calls this endpoint
+ * periodically to bring due wallets up to date inside a bounded budget.
+ */
+api.post('/sync', async (req, res) => {
+  try {
+    const budgetMs = clampInt(req.body?.budgetMs, 2000, 55_000, config.serverlessSyncBudgetMs);
+    const result = await syncDueWallets(budgetMs);
+    res.json({ ...result, deployment: config.isServerless ? 'serverless' : 'server' });
+  } catch (err) {
+    res.status(500).json({ error: `Sync pass failed: ${err.message}` });
+  }
 });
 
 api.get('/settings', (req, res) => {
@@ -153,6 +169,10 @@ api.post('/wallets', async (req, res) => {
     });
     if (probe.length === 0) {
       updateWallet(address, { last_error: 'Profile has no public activity yet.', status: 'error' });
+    } else if (config.isServerless) {
+      // No background process survives the response — run the initial sync
+      // inline within a bounded budget so the trader is usable immediately.
+      try { await syncWalletNow(address, { budgetMs: config.serverlessInitialSyncBudgetMs }); } catch { /* surfaced via wallet status */ }
     } else {
       // kick off the initial historical sync without blocking the response
       syncWalletNow(address).catch(() => {});
@@ -393,4 +413,9 @@ api.post('/bridge/result', (req, res) => {
 });
 
 // ------------------------------------------------------------------- SSE ---
-api.get('/events', sseHandler);
+// Serverless functions cannot hold streams open between requests — the client
+// detects this via GET /api/system (deployment=serverless) and polls instead.
+api.get('/events', (req, res, next) => {
+  if (config.isServerless) return res.status(501).json({ error: 'SSE is not available in serverless mode; data refreshes via POST /api/sync.' });
+  return sseHandler(req, res, next);
+});
