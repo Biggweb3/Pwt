@@ -5,11 +5,13 @@ import {
   globalFeed, getSetting, setSetting, unreadNotificationCount,
 } from './db.js';
 import * as pm from './polymarketService.js';
-import { computeDashboardStats, windowSummary, pnlSeries, PERIODS, periodCutoff } from './analytics.js';
+import { computeDashboardStats, windowSummary, pnlSeries, PERIODS, periodCutoff, winRateSeries } from './analytics.js';
+import { listPredictions, predictionTotals, resolutionView } from './db.js';
+import { computePredictionStats, calculateTraderWinRate, rebuildPredictions, resolveMarketsForWallet, profitabilityFromClosedPositions, REASON_LABELS, PREDICTION_WINDOWS, PRIMARY_PREDICTION_WINDOW } from './predictions.js';
 import { syncWalletNow, syncDueWallets } from './syncEngine.js';
-import { sseHandler } from './events.js';
+import { sseHandler, broadcast } from './events.js';
 import { claimJobs, resolveJob, noteBridgeClientSeen, bridgeInUse, pendingJobCount } from './bridge.js';
-import { listRules, addRule, setRuleEnabled, deleteRule } from './alerts.js';
+import { listRules, addRule, setRuleEnabled, updateRuleParams, deleteRule } from './alerts.js';
 import { parseTraderInput, normalizeAddress, clampInt, nowSec } from './util.js';
 import { transportGet, qs } from './transport.js';
 
@@ -209,7 +211,13 @@ api.get('/wallets/:address', (req, res) => {
   const stats = computeDashboardStats(id);
   res.json({
     wallet: walletView(w),
-    overview: { ...stats, api: safeJson(w.stats_json)?.api || null },
+    overview: {
+      ...stats,
+      api: safeJson(w.stats_json)?.api || null,
+      predictionsUpdatedAt: w.predictions_updated_at ?? null,
+      closedHistoryComplete: !!w.closed_history_complete,
+      positionsScanComplete: !!w.positions_scan_complete,
+    },
   });
 });
 
@@ -297,6 +305,188 @@ api.get('/wallets/:address/positions', (req, res) => {
   res.json({ positions: rows, updatedAt: rows[0] ? db.prepare('SELECT updated_at FROM positions WHERE wallet = ? LIMIT 1').get(id)?.updated_at : null });
 });
 
+/**
+ * The independently calculated win rate — one endpoint, one definition, used by
+ * every screen. Also returns the "Polymarket reported" figures next to ours so a
+ * discrepancy is visible instead of silent (spec 8), and the raw evidence behind
+ * the difference (spec 9/23).
+ */
+api.get('/wallets/:address/win-rate', async (req, res) => {
+  const id = normalizeAddress(req.params.address);
+  const w = id && getWallet(id);
+  if (!w) return res.status(404).json({ error: 'Unknown wallet.' });
+  const force = req.query.refresh === '1' || req.query.refresh === 'true';
+  try {
+    if (force) {
+      await resolveMarketsForWallet(id, { budget: config.resolutionLookupsPerCycle * 3 });
+      rebuildPredictions(id);
+    }
+    const stats = await calculateTraderWinRate(id, { wallet: w });
+    const apiStats = safeJson(w.stats_json)?.api || null;
+    res.json({
+      address: id,
+      methodology: {
+        definition: 'Percentage of the trader’s most recent completed predictions that resolved in their favour.',
+        window: PRIMARY_PREDICTION_WINDOW,
+        windows: PREDICTION_WINDOWS,
+        excludes: ['open / unresolved positions', 'markets without a final resolution', 'hedged (both sides of one market)', 'positions with no readable direction'],
+        groupsBy: ['wallet', 'market (condition id)', 'outcome token', 'position lifecycle'],
+        neverUsed: ['trading profit or loss', 'Polymarket profile numbers', 'current mark-to-market prices'],
+        tooltip: 'Win rate is independently calculated from the trader’s most recent completed predictions. Open and unresolved positions are excluded. Multiple transactions belonging to the same prediction are grouped to prevent double counting.',
+      },
+      // PRIMARY METRIC (independently calculated) vs what Polymarket itself publishes
+      comparison: {
+        independentlyCalculated: {
+          winRate: stats.primary.winRate,
+          wins: stats.primary.wins,
+          losses: stats.primary.losses,
+          analyzed: stats.primary.analyzed,
+          label: stats.primary.label,
+        },
+        polymarketReported: {
+          // Polymarket's public per-wallet APIs expose profit and volume windows only —
+          // there is no public "win rate" endpoint to trust or distrust. Verified while
+          // implementing this: profiles show P&L/volume/markets-traded, not a hit rate.
+          winRate: null,
+          unavailableReason: 'Polymarket’s public API does not expose a per-wallet win rate.',
+          pnl: apiStats?.pnl ?? null,
+          volume: apiStats?.volume ?? null,
+          marketsTraded: apiStats?.marketsTraded ?? null,
+          portfolioValue: apiStats?.value ?? null,
+        },
+        // What the trader’s closed positions would say if "win" meant "made money".
+        // Displayed for contrast only — it is explicitly NOT the win rate.
+        profitabilityCrossCheck: {
+          label: 'Closed positions with positive realized P&L',
+          rate: stats.profitability.rate,
+          wins: stats.profitability.wins,
+          losses: stats.profitability.losses,
+          flat: stats.profitability.flat,
+          closed: stats.profitability.closed,
+          note: 'Profitability of closed positions — not prediction accuracy. Not used anywhere as a win rate.',
+        },
+      },
+      stats,
+    });
+  } catch (err) {
+    res.status(500).json({ error: `Win-rate calculation failed: ${err.message}` });
+  }
+});
+
+/**
+ * Auditable prediction ledger: the exact rows behind the win rate, newest first.
+ * Filters: result=WIN|LOSS|UNDETERMINED, status=COMPLETED|OPEN, market=<text>,
+ * window=<N> (the “last N classified predictions” sample the headline number uses).
+ * The window is applied BEFORE the result filter, so “wins in the last 10” really
+ * means wins among that sample rather than the 10 newest wins of all time.
+ */
+api.get('/wallets/:address/predictions', (req, res) => {
+  const id = normalizeAddress(req.params.address);
+  if (!id || !walletExists(id)) return res.status(404).json({ error: 'Unknown wallet.' });
+  const RESULT = String(req.query.result || '').toUpperCase();
+  const result = ['WIN', 'LOSS', 'UNDETERMINED'].includes(RESULT) ? RESULT : null;
+  const STATUS = String(req.query.status || '').toUpperCase();
+  const status = STATUS === 'OPEN' || STATUS === 'COMPLETED' ? STATUS : null;
+  const windowSize = clampInt(req.query.window, 1, 1000, PRIMARY_PREDICTION_WINDOW);
+  const page = clampInt(req.query.page, 1, 100000, 1);
+  const pageSize = clampInt(req.query.pageSize, 1, 100, 25);
+  const market = typeof req.query.market === 'string' && req.query.market.trim() ? req.query.market.trim().slice(0, 120) : null;
+
+  const { rows } = listPredictions(id, { limit: 100000, offset: 0 });
+  const all = rows.map((r) => ({
+    ...r,
+    source_transactions: safeJson(r.source_transactions) || [],
+    reasonLabel: r.reason ? REASON_LABELS[r.reason] || r.reason : null,
+    marketUrl: r.market_slug ? `https://polymarket.com/event/${r.event_slug || r.market_slug}` : null,
+  }));
+  const classified = all.filter((r) => r.result === 'WIN' || r.result === 'LOSS');
+  const inWindow = new Set(classified.slice(0, windowSize).map((r) => r.condition_id));
+
+  // “Excluded / undetermined” is about rows that never entered the denominator, so it
+  // is deliberately not window-scoped; everything else is scoped first, then filtered.
+  const wantsExcluded = result === 'UNDETERMINED' || status === 'OPEN';
+  let scoped = wantsExcluded
+    ? all.filter((r) => r.result === 'UNDETERMINED')
+    : classified.filter((r) => inWindow.has(r.condition_id));
+  if (status) scoped = scoped.filter((r) => r.status === status);
+  if (result && result !== 'UNDETERMINED') scoped = scoped.filter((r) => r.result === result);
+  if (market) {
+    const needle = market.toLowerCase();
+    scoped = scoped.filter((r) => (r.market_name || '').toLowerCase().includes(needle) || (r.condition_id || '') === market);
+  }
+  scoped = scoped.map((r) => ({ ...r, in_window: inWindow.has(r.condition_id) }));
+
+  const totals = predictionTotals(id);
+  res.json({
+    page, pageSize,
+    total: scoped.length,
+    pages: Math.max(1, Math.ceil(scoped.length / pageSize)),
+    window: windowSize,
+    windowAnalyzed: Math.min(windowSize, classified.length),
+    totals: {
+      completed: totals?.completed || 0, wins: totals?.wins || 0, losses: totals?.losses || 0,
+      undetermined: totals?.undetermined || 0,
+    },
+    predictions: scoped.slice((page - 1) * pageSize, page * pageSize),
+  });
+});
+
+/** Single prediction: everything needed to verify one row against public data. */
+api.get('/wallets/:address/predictions/:conditionId', (req, res) => {
+  const id = normalizeAddress(req.params.address);
+  if (!id || !walletExists(id)) return res.status(404).json({ error: 'Unknown wallet.' });
+  const cid = String(req.params.conditionId || '');
+  const row = db.prepare(`SELECT * FROM predictions WHERE wallet = ? AND (condition_id = ? OR market_slug = ?)`).get(id, cid, cid);
+  if (!row) return res.status(404).json({ error: 'Unknown prediction for this wallet.' });
+  // `resolutionView` parses the cached outcome list so the audit table can show the
+  // per-outcome prices/winners exactly as Polymarket published them.
+  const resolution = row.condition_id ? resolutionView(row.condition_id) : null;
+  const trades = db.prepare(`SELECT ts, side, outcome, outcome_index, price, shares, value, tx_hash FROM trades
+    WHERE wallet = ? AND (condition_id = ? OR slug = ?) ORDER BY ts DESC LIMIT 200`).all(id, row.condition_id, row.market_slug || '');
+  const positions = db.prepare(`SELECT 'open' AS kind, asset, size, avg_price, initial_value, current_value, cash_pnl, realized_pnl, cur_price, redeemable, outcome, outcome_index FROM positions WHERE wallet = ? AND (condition_id = ? OR slug = ?)
+    UNION ALL
+    SELECT 'closed' AS kind, asset, NULL AS size, avg_price, total_bought AS initial_value, NULL AS current_value, realized_pnl, realized_pnl, cur_price, NULL AS redeemable, outcome, outcome_index FROM closed_positions WHERE wallet = ? AND (condition_id = ? OR slug = ?)`)
+    .all(id, row.condition_id, row.market_slug || '', id, row.condition_id, row.market_slug || '');
+  res.json({
+    prediction: {
+      ...row,
+      source_transactions: safeJson(row.source_transactions) || [],
+      reasonLabel: row.reason ? REASON_LABELS[row.reason] || row.reason : null,
+      marketUrl: row.market_slug ? `https://polymarket.com/event/${row.event_slug || row.market_slug}` : null,
+    },
+    resolution: resolution ? { ...resolution, outcomes: safeJson(resolution.outcomes_json) } : null,
+    positions,
+    transactions: trades,
+    groupingNote: `${trades.length} fill(s) and ${positions.length} position record(s) were grouped into this single prediction; repeated buys/sells in the same market never count twice.`,
+  });
+});
+
+/** Rebuild the classification now (debug / "re-verify" action). */
+api.post('/wallets/:address/predictions/rebuild', async (req, res) => {
+  const id = normalizeAddress(req.params.address);
+  if (!id || !walletExists(id)) return res.status(404).json({ error: 'Unknown wallet.' });
+  try {
+    const lookups = await resolveMarketsForWallet(id, { budget: config.resolutionLookupsPerCycle * 3 });
+    const built = rebuildPredictions(id);
+    const stats = computePredictionStats(id);
+    const fresh = computeDashboardStats(id, safeJson(getWallet(id).stats_json)?.api || null);
+    updateWallet(id, { stats_json: JSON.stringify(fresh) });
+    broadcast('wallet:update', { walletId: id, status: getWallet(id).status, stats: fresh });
+    res.json({ ...built, lookups, primary: stats.primary, totals: stats.totals, exclusions: stats.exclusions });
+  } catch (err) {
+    res.status(500).json({ error: `Rebuild failed: ${err.message}` });
+  }
+});
+
+/** Accuracy-over-time series (predictions only; money is a separate chart). */
+api.get('/wallets/:address/accuracy', (req, res) => {
+  const id = normalizeAddress(req.params.address);
+  if (!id || !walletExists(id)) return res.status(404).json({ error: 'Unknown wallet.' });
+  const window = clampInt(req.query.window, 5, 200, 20);
+  const period = PERIODS[req.query.period] ? req.query.period : 'all';
+  res.json(winRateSeries(id, { window, minTs: periodCutoff(period) }));
+});
+
 // ----------------------------------------------------------------- feeds ---
 api.get('/feed/global', (req, res) => {
   const limit = clampInt(req.query.limit, 1, 200, 60);
@@ -326,32 +516,48 @@ api.get('/search', (req, res) => {
 // --------------------------------------------------------------- compare ---
 api.get('/compare', (req, res) => {
   const rows = listWallets().map((w) => {
-    const s = safeJson(w.stats_json) || computeDashboardStats(w.id);
-    const api = s.api || {};
-    const win24 = windowSummary(w.id, '24h').win;
-    const win7d = windowSummary(w.id, '7d').win;
+    const live = computePredictionStats(w.id, { periods: { '24h': nowSec() - 86400, '7d': nowSec() - 7 * 86400 } });
+    const cached = safeJson(w.stats_json) || {};
+    const api = cached.api || {};
+    const primary = live.primary;
+    const profit = profitabilityFromClosedPositions(w.id);
     return {
       address: w.id,
       username: w.username || w.pseudonym,
       profileImage: w.profile_image,
       status: w.status,
-      lastActivityTs: s.lastActivityTs,
-      winRate24h: win24.winRate,
-      winRate7d: win7d.winRate,
-      winRateAll: s.winRateAll,
-      trades24h: s.trades24h,
-      trades7d: s.trades7d,
-      volume24h: api.volume?.['1d'] ?? s.volume24h,
-      volume7d: api.volume?.['7d'] ?? s.volume7d,
+      lastActivityTs: cached.lastActivityTs ?? null,
+      // Prediction win rate (independently calculated) — with its sample size.
+      winRate: primary.winRate,
+      winRateWins: primary.wins,
+      winRateLosses: primary.losses,
+      winRateAnalyzed: primary.analyzed,
+      winRateLabel: primary.label,
+      winRate24h: live.periods['24h']?.winRate ?? null,
+      winRate24hN: live.periods['24h']?.analyzed ?? 0,
+      winRate7d: live.periods['7d']?.winRate ?? null,
+      winRate7dN: live.periods['7d']?.analyzed ?? 0,
+      winRateAll: live.windows.all.winRate,
+      winRateAllN: live.windows.all.analyzed,
+      openExcluded: live.exclusions.openPositions,
+      pendingResolutions: live.exclusions.pendingResolutions,
+      // Trading money — deliberately separate from accuracy.
+      profitabilityRate: profit.rate,
+      profitabilityN: profit.wins + profit.losses,
+      trades24h: cached.trades24h ?? null,
+      trades7d: cached.trades7d ?? null,
+      volume24h: api.volume?.['1d'] ?? cached.volume24h ?? null,
+      volume7d: api.volume?.['7d'] ?? cached.volume7d ?? null,
       volumeAll: api.volume?.all ?? null,
       pnl24h: api.pnl?.['1d'] ?? null,
       pnl7d: api.pnl?.['7d'] ?? null,
       pnlAll: api.pnl?.all ?? null,
-      activePositions: s.activePositions,
-      openValue: s.openValue,
+      predictionPnl: live.totals.totalPnl,
+      activePositions: cached.activePositions ?? null,
+      openValue: cached.openValue ?? null,
     };
   });
-  res.json({ rows });
+  res.json({ rows, basis: 'prediction' });
 });
 
 // ----------------------------------------------------- suggestions / misc ---
@@ -387,8 +593,13 @@ api.post('/alerts/rules', (req, res) => {
   }
 });
 api.patch('/alerts/rules/:id', (req, res) => {
-  setRuleEnabled(parseInt(req.params.id, 10), !!req.body?.enabled);
-  res.json({ ok: true });
+  const id = parseInt(req.params.id, 10);
+  const body = req.body || {};
+  // Only touch what the caller actually sent, so editing a threshold never silently
+  // disables the rule (and toggling never wipes its parameters).
+  if ('enabled' in body) setRuleEnabled(id, !!body.enabled);
+  const rule = 'params' in body ? updateRuleParams(id, body.params || {}) : null;
+  res.json({ ok: true, rule: rule || undefined });
 });
 api.delete('/alerts/rules/:id', (req, res) => {
   deleteRule(parseInt(req.params.id, 10));

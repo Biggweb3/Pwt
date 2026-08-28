@@ -10,6 +10,8 @@ export interface ApiStats {
 
 export interface WalletStats {
   computedAt: number;
+  /** The ONLY win-rate source in the app (see server/predictions.js). */
+  predictions?: PredictionStats | null;
   lastActivityTs: number | null;
   lastTrade: { ts: number; title: string | null; side: string; outcome: string | null; value: number | null } | null;
   firstObservedTs: number | null;
@@ -24,6 +26,7 @@ export interface WalletStats {
   openValue: number | null;
   openUnrealizedPnl: number | null;
   closedPositions: number;
+  redeemablePositions?: number;
   api: ApiStats | null;
 }
 
@@ -131,9 +134,19 @@ export interface ClosedPosition {
 
 export interface WindowSummary {
   period: string;
+  periodLabel?: string;
   trades: { trades: number; buys: number; sells: number; volume: number | null; avgTradeSize: number | null; largestTrade: number | null; markets: number };
-  win: { closedInWindow: number; wins: number; losses: number; flat: number; winRate: number | null; realizedPnl: number | null };
-  positions: { activePositions: number; openValue: number | null; openUnrealizedPnl: number | null; closedPositions: number };
+  win: {
+    basis: 'prediction';
+    analyzed: number; wins: number; losses: number; excluded: number; completedInWindow: number;
+    winRate: number | null; sampleSize: number; window: number; windowAnalyzed: number;
+    windowWinRate: number | null; windowLimited: boolean; windowLabel: string;
+    openExcluded: number; undeterminedAll: number; basisLabel: string;
+  };
+  predictions?: PredictionStats;
+  profitability?: { label: string; closed: number; wins: number; losses: number; flat: number; rate: number | null; realizedPnl: number | null; period?: string };
+  pnl?: { realized: number | null; fromPredictions: number | null };
+  positions: { activePositions: number; openValue: number | null; openUnrealizedPnl: number | null; closedPositions: number; redeemablePositions?: number };
   apiPnl?: number | null;
   apiVolume?: number | null;
 }
@@ -164,4 +177,130 @@ export interface SystemInfo {
   bridgeJobsPending: number;
   pollInterval: number;
   serverTime: number;
+}
+
+// ---------------------------------------------------------------------------
+// Independently calculated prediction analytics (see server/predictions.js).
+// Every win-rate figure in the UI comes from this shape — there is no second
+// calculation anywhere else in the app.
+// ---------------------------------------------------------------------------
+export type PredictionResult = 'WIN' | 'LOSS' | 'UNDETERMINED';
+export type PredictionStatus = 'COMPLETED' | 'OPEN';
+
+export interface PredictionWindow {
+  window: number | null;
+  scanned: number;
+  analyzed: number;
+  wins: number;
+  losses: number;
+  excluded: number;
+  reasons?: Record<string, number>;
+  winRate: number | null;
+  limited: boolean;
+  truncated?: boolean;
+  pnl: number | null;
+  label?: string;
+}
+
+export interface PredictionPeriod {
+  analyzed: number; wins: number; losses: number; excluded: number;
+  scanned: number; winRate: number | null; pnl: number | null;
+}
+
+export interface PredictionStats {
+  computedAt: number;
+  primary: PredictionWindow & { label: string };
+  windows: Record<string, PredictionWindow>;
+  periods: Record<string, PredictionPeriod>;
+  totals: {
+    completed: number; wins: number; losses: number; undetermined: number; analyzed: number;
+    winRate: number | null; costUsdc: number | null; realizedPnl: number | null; totalPnl: number | null;
+    oldestCompletedAt: number | null; newestCompletedAt: number | null;
+  };
+  exclusions: { openPositions: number; openPendingResolution: number; pendingResolutions: number; note: string };
+  coverage: { scannedCompleted: number; scanCap: number; sourceWindow: number; closedHistoryComplete: boolean; positionsScanComplete?: boolean };
+  profitability?: {
+    label: string; closed: number; wins: number; losses: number; flat: number;
+    rate: number | null; realizedPnl: number | null; period?: string;
+  };
+}
+
+export interface PredictionRow {
+  condition_id: string;
+  market_name: string | null;
+  market_slug: string | null;
+  event_slug: string | null;
+  predicted_outcome: string | null;
+  predicted_index: number | null;
+  final_outcome: string | null;
+  final_index: number | null;
+  result: PredictionResult;
+  status: PredictionStatus;
+  reason: string | null;
+  reasonLabel: string | null;
+  marketUrl: string | null;
+  cost_usdc: number | null;
+  proceeds_usdc: number | null;
+  realized_pnl: number | null;
+  unrealized_pnl: number | null;
+  total_pnl: number | null;
+  shares_predicted: number | null;
+  trades_count: number;
+  positions_count: number;
+  hedged: number;
+  started_at: number | null;
+  completed_at: number | null;
+  completed_from: string | null;
+  resolved_at: number | null;
+  source_transactions: { ts: number; side: string; outcome: string | null; price: number | null; shares: number | null; value: number | null; txHash: string | null }[];
+  resolution_source: string | null;
+  /** false = outside the “last N” sample the headline rate uses */
+  in_window?: boolean;
+}
+
+export interface PredictionLedger {
+  page: number; pageSize: number; total: number; pages: number; window: number; windowAnalyzed?: number;
+  totals: { completed: number; wins: number; losses: number; undetermined: number };
+  predictions: PredictionRow[];
+}
+
+export interface PredictionDetail {
+  prediction: PredictionRow & { source_transactions: PredictionRow['source_transactions']; needs_resolution: number };
+  resolution: {
+    condition_id: string; question: string | null; market_state: string; closed: number; resolved: number;
+    winning_index: number | null; winning_outcome: string | null; winning_token: string | null;
+    closed_at: number | null; source: string | null; reason: string | null; attempts: number;
+    outcomes: { index: number; outcome: string; token_id: string | null; price: number | null; winner: boolean }[] | null;
+  } | null;
+  positions: {
+    kind: 'open' | 'closed'; asset: string; size: number | null; avg_price: number | null;
+    initial_value: number | null; current_value: number | null; cash_pnl: number | null;
+    realized_pnl: number | null; cur_price: number | null; redeemable: number | null;
+    outcome: string | null; outcome_index: number | null;
+  }[];
+  transactions: { ts: number; side: string; outcome: string | null; outcome_index: number | null; price: number | null; shares: number | null; value: number | null; tx_hash: string | null }[];
+  groupingNote: string;
+}
+
+export interface WinRatePayload {
+  address: string;
+  methodology: {
+    definition: string; window: number; windows: number[]; excludes: string[];
+    groupsBy: string[]; neverUsed: string[]; tooltip: string;
+  };
+  comparison: {
+    independentlyCalculated: { winRate: number | null; wins: number; losses: number; analyzed: number; label: string };
+    polymarketReported: {
+      winRate: number | null; unavailableReason: string | null;
+      pnl: Record<string, number | null> | null; volume: Record<string, number | null> | null;
+      marketsTraded: number | null; portfolioValue: number | null;
+    };
+    profitabilityCrossCheck: { label: string; rate: number | null; wins: number; losses: number; flat: number; closed: number; note: string };
+  };
+  stats: PredictionStats & { profitability?: PredictionStats['profitability'] };
+}
+
+export interface AccuracySeries {
+  kind: 'accuracy'; window: number;
+  points: { ts: number; accuracy: number; pnl: number; sample: number }[];
 }

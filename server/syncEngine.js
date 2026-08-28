@@ -15,6 +15,7 @@ import { config } from './config.js';
 import { db, getWallet, updateWallet, insertTrades, insertActivity, replacePositions, upsertClosedPositions } from './db.js';
 import * as pm from './polymarketService.js';
 import { computeDashboardStats } from './analytics.js';
+import { rebuildPredictions, resolveMarketsForWallet } from './predictions.js';
 import { evaluateNewTrades, evaluateNewActivity, evaluateWinRate } from './alerts.js';
 import { broadcast } from './events.js';
 import { nowSec, tradeDedupeKey, activityDedupeKey } from './util.js';
@@ -63,9 +64,9 @@ export function ingestActivityRaw(walletId, rawRows) {
   return fresh;
 }
 
-export function ingestPositionsRaw(walletId, rawRows) {
+export function ingestPositionsRaw(walletId, rawRows, complete = true) {
   const rows = (rawRows || []).map(pm.normalizePosition).filter((r) => r.asset);
-  replacePositions(walletId, rows, nowSec());
+  replacePositions(walletId, rows, nowSec(), { complete });
   return rows.length;
 }
 
@@ -119,6 +120,70 @@ function refreshProfile(wallet, rawProfile) {
 }
 
 // ---------------------------------------------------------------------------
+// position / closed-position paging for the prediction engine
+// ---------------------------------------------------------------------------
+/**
+ * Open positions, paged. Two passes on purpose:
+ *   • default snapshot (value DESC) — what the dashboard shows as "active positions"
+ *   • `redeemable=true` — markets that already resolved while the wallet still holds
+ *     the tokens. These have zero current value, so a value-ordered snapshot alone
+ *     would drop them, and dropping them drops the LOSSES (a trader who lost usually
+ *     just leaves the worthless tokens sitting there). That bias was a big part of why
+ *     win rates looked like 100%.
+ */
+async function fetchPositionSnapshot(address, { pages = 2, outOfTime = () => false } = {}) {
+  const byAsset = new Map();
+  let complete = true;
+  for (const opts of [{}, { redeemable: true }]) {
+    for (let i = 0; i < pages; i++) {
+      if (outOfTime()) { complete = false; break; }
+      let page;
+      try {
+        page = await execGet(pm.positionsUrl(address, { limit: 500, offset: i * 500, sortBy: 'CURRENT', sortDirection: 'DESC', ...opts }));
+      } catch (err) {
+        if (!opts.redeemable) throw err;      // primary snapshot must still fail the cycle
+        complete = false; break;              // optional pass unsupported — keep what we have
+      }
+      if (!Array.isArray(page)) { complete = false; break; }
+      for (const r of page) if (r && r.asset) byAsset.set(String(r.asset), r);
+      if (page.length < 500) break;
+      if (i === pages - 1) complete = false;  // capped: more pages exist
+    }
+  }
+  return { rows: [...byAsset.values()], complete };
+}
+
+/**
+ * Closed positions, paged NEWEST FIRST. The endpoint sorts ascending by default, so
+ * this always passes sortBy/sortDirection explicitly — without it only the oldest
+ * records ever arrive and fresh settlements are never seen.
+ * `afterTs` stops the walk once we are past the newest stored record (incremental).
+ */
+async function fetchClosedPages(address, { max, afterTs = null, outOfTime = () => false } = {}) {
+  const rows = [];
+  let offset = 0;
+  let reachedEnd = false;
+  while (offset < max) {
+    if (outOfTime()) break;
+    let page;
+    try {
+      page = await execGet(pm.closedPositionsUrl(address, { limit: 500, offset }));
+    } catch (err) {
+      if (offset === 0) throw err;
+      break;                                  // partial result still usable
+    }
+    if (!Array.isArray(page)) break;
+    if (!page.length) { reachedEnd = true; break; }
+    rows.push(...page);
+    offset += page.length;
+    const oldest = Number(page[page.length - 1]?.timestamp);
+    if (afterTs && Number.isFinite(oldest) && oldest <= afterTs) { reachedEnd = true; break; }
+    if (page.length < 500) { reachedEnd = true; break; }
+  }
+  return { rows, complete: reachedEnd };
+}
+
+// ---------------------------------------------------------------------------
 // full sync cycle for one wallet
 // ---------------------------------------------------------------------------
 async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
@@ -151,9 +216,11 @@ async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
       let offset = 0;
       let total = 0;
       let historyComplete = false;
+      // takerOnly=false = every fill (maker + taker): position reconstruction and the
+      // trade table must not miss the half of the history that a taker-only view hides.
       while (offset < config.initialMaxTrades) {
         if (outOfTime()) break; // serverless budget: converge now, deepen later via resync
-        const page = await execGet(qs(`${D}/trades`, { user: address, limit: 500, offset, takerOnly: true }));
+        const page = await execGet(qs(`${D}/trades`, { user: address, limit: 500, offset, takerOnly: false }));
         if (!Array.isArray(page)) break;
         newTrades.push(...ingestTradesRaw(wallet.id, page));
         total += page.length;
@@ -172,18 +239,15 @@ async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
         if (page.length < 500) break;
       }
 
-      // positions snapshot + closed positions
+      // position snapshots + closed positions — the raw material for predictions
       if (!outOfTime()) {
-        const pos = await execGet(qs(`${D}/positions`, { user: address, limit: 500, sortBy: 'CURRENT', sortDirection: 'DESC' }));
-        ingestPositionsRaw(wallet.id, Array.isArray(pos) ? pos : []);
-        let closedOffset = 0;
-        while (closedOffset < config.maxClosedPositions && !outOfTime()) {
-          const page = await execGet(qs(`${D}/closed-positions`, { user: address, limit: 500, offset: closedOffset }));
-          if (!Array.isArray(page) || !page.length) break;
-          ingestClosedPositionsRaw(wallet.id, page);
-          if (page.length < 500) break;
-          closedOffset += 500;
-        }
+        const pos = await fetchPositionSnapshot(address, { pages: Math.max(1, Math.floor(config.predictionPositionPages / 2)), outOfTime });
+        ingestPositionsRaw(wallet.id, pos.rows, pos.complete);
+        const closed = await fetchClosedPages(address, { max: config.predictionClosedPositions, outOfTime });
+        ingestClosedPositionsRaw(wallet.id, closed.rows);
+        const newestClosed = closed.rows.reduce((m, r) => Math.max(m, Number(r.timestamp) || 0), 0) || null;
+        db.prepare('UPDATE wallets SET closed_history_complete = ?, closed_newest_ts = ? WHERE id = ?')
+          .run(closed.complete ? 1 : 0, newestClosed, wallet.id);
       }
 
       apiStats = await refreshApiStats(wallet.id, address);
@@ -193,7 +257,7 @@ async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
       // ---- incremental sync ----------------------------------------------
       const w = getWallet(wallet.id);
       if (w.newest_trade_ts) {
-        const page = await execGet(qs(`${D}/trades`, { user: address, limit: 500, start: w.newest_trade_ts, takerOnly: true }));
+        const page = await execGet(qs(`${D}/trades`, { user: address, limit: 500, start: w.newest_trade_ts, takerOnly: false }));
         if (Array.isArray(page)) newTrades.push(...ingestTradesRaw(wallet.id, page));
       }
       if (w.newest_activity_ts) {
@@ -203,12 +267,20 @@ async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
 
       const cycles = w.sync_cycles + 1;
       if (cycles % config.positionsRefreshEvery === 0) {
-        const pos = await execGet(qs(`${D}/positions`, { user: address, limit: 500, sortBy: 'CURRENT', sortDirection: 'DESC' }));
-        ingestPositionsRaw(wallet.id, Array.isArray(pos) ? pos : []);
+        const pos = await fetchPositionSnapshot(address, { pages: Math.max(1, Math.floor(config.predictionPositionPages / 2)), outOfTime });
+        ingestPositionsRaw(wallet.id, pos.rows, pos.complete);
       }
       if (cycles % config.closedRefreshEvery === 0) {
-        const page = await execGet(qs(`${D}/closed-positions`, { user: address, limit: 500 }));
-        if (Array.isArray(page) && page.length) ingestClosedPositionsRaw(wallet.id, page);
+        // Only walk back as far as the newest closed position already stored, so a
+        // 10k-trade wallet does not re-download its whole history every cycle.
+        const afterTs = w.closed_newest_ts ? w.closed_newest_ts - 60 : null;
+        const closed = await fetchClosedPages(address, { max: 1000, afterTs, outOfTime });
+        if (closed.rows.length) {
+          ingestClosedPositionsRaw(wallet.id, closed.rows);
+          const newestClosed = closed.rows.reduce((m, r) => Math.max(m, Number(r.timestamp) || 0), afterTs || 0) || null;
+          db.prepare('UPDATE wallets SET closed_history_complete = ?, closed_newest_ts = ? WHERE id = ?')
+            .run(closed.complete ? 1 : 0, newestClosed, wallet.id);
+        }
       }
       if (cycles % config.statsRefreshEvery === 0) {
         apiStats = await refreshApiStats(wallet.id, address);
@@ -225,6 +297,26 @@ async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
           });
         } catch { /* non-fatal */ }
       }
+    }
+
+    // ---- prediction engine (win rate) --------------------------------------
+    // Order matters: rebuild from what is stored, resolve any markets we still lack
+    // outcomes for, then rebuild so the fresh resolutions are applied. Predictions are
+    // the ONLY source of every win-rate number in the app.
+    const isInitial = !wallet.initial_sync_done;
+    let predictionMeta = { classified: 0, lookedUp: 0, pending: 0 };
+    try {
+      rebuildPredictions(wallet.id);
+      const res = await resolveMarketsForWallet(wallet.id, {
+        budget: isInitial ? config.resolutionLookupsInitial : config.resolutionLookupsPerCycle,
+        deadline: outOfTime() ? Date.now() : deadline,
+      });
+      if (res.lookedUp > 0) rebuildPredictions(wallet.id);
+      predictionMeta = { classified: res.lookedUp, lookedUp: res.resolved || 0, pending: res.pending || 0 };
+    } catch (err) {
+      // Never fail a sync because a market's metadata was unavailable: the affected
+      // predictions simply stay UNDETERMINED (and are retried next cycle).
+      console.warn(`[predictions] ${wallet.id}: ${err?.message || err}`);
     }
 
     // ---- post-processing ---------------------------------------------------
@@ -259,9 +351,23 @@ async function runCycle(wallet, { deadline = Number.POSITIVE_INFINITY } = {}) {
       broadcast('activity:new', { walletId: wallet.id, count: newActivity.length });
     }
     if (newTrades.length || newActivity.length) broadcast('feed:update', {});
-    evaluateWinRate(wallet.id, getWallet(wallet.id).username || getWallet(wallet.id).pseudonym, stats.winRateAll);
+    // Alerts use the independently calculated prediction win rate, with its sample size.
+    evaluateWinRate(wallet.id, getWallet(wallet.id).username || getWallet(wallet.id).pseudonym, stats.predictions?.primary?.winRate ?? null, stats.predictions?.primary?.analyzed ?? 0);
     broadcast('wallet:update', { walletId: wallet.id, status: 'live', stats });
-    return { ok: true, newTrades: newTrades.length, newActivity: newActivity.length };
+    broadcast('predictions:update', {
+      walletId: wallet.id,
+      winRate: stats.predictions?.primary?.winRate ?? null,
+      analyzed: stats.predictions?.primary?.analyzed ?? 0,
+      pendingResolutions: predictionMeta.pending,
+    });
+    return {
+      ok: true,
+      newTrades: newTrades.length,
+      newActivity: newActivity.length,
+      predictions: stats.predictions?.primary ?? null,
+      marketsResolved: predictionMeta.lookedUp,
+      pendingResolutions: predictionMeta.pending,
+    };
   } catch (err) {
     const w = getWallet(wallet.id);
     const consecutive = (w.consecutive_errors || 0) + 1;

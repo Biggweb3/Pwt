@@ -11,7 +11,8 @@
  *   large_trade      — trade value >= params.minValue
  *   market_entry     — trade in a market whose title matches params.keyword
  *   position_closed  — REDEEM activity seen for the wallet
- *   winrate_cross    — all-time win rate crosses params.threshold (%) after a sync
+ *   winrate_cross    — prediction win rate (independently calculated) crosses
+ *                      params.threshold (%) after a sync; message always carries the sample size
  */
 import { db } from './db.js';
 import { nowSec } from './util.js';
@@ -30,6 +31,14 @@ export function addRule({ kind, wallet = null, params = {} }) {
   const info = db.prepare('INSERT INTO alert_rules (enabled, kind, wallet, params, created_at) VALUES (1, ?, ?, ?, ?)')
     .run(kind, wallet, JSON.stringify(params || {}), nowSec());
   return db.prepare('SELECT * FROM alert_rules WHERE id = ?').get(info.lastInsertRowid);
+}
+
+/** Replace a rule's parameters (e.g. moving a win-rate threshold) without touching
+ * its enabled state — the alert that reports the win rate must stay editable. */
+export function updateRuleParams(id, params) {
+  db.prepare('UPDATE alert_rules SET params = ? WHERE id = ?').run(JSON.stringify(params || {}), id);
+  const row = db.prepare('SELECT * FROM alert_rules WHERE id = ?').get(id);
+  return row ? { ...row, params: row.params ? JSON.parse(row.params) : {} } : null;
 }
 
 export const setRuleEnabled = (id, enabled) =>
@@ -106,8 +115,12 @@ export function evaluateNewActivity(walletId, username, newActivity) {
   }
 }
 
-/** Evaluate win-rate threshold rules after analytics refresh. */
-export function evaluateWinRate(walletId, username, winRateAll) {
+/**
+ * Evaluate prediction-win-rate threshold rules after the analytics refresh.
+ * `analyzed` is the sample size — an alert that says "100%" without "of 4
+ * predictions" would be exactly the misleading number this app must avoid.
+ */
+export function evaluateWinRate(walletId, username, winRateAll, analyzed = 0) {
   if (winRateAll == null) return;
   for (const rule of rulesFor('winrate_cross', walletId)) {
     const threshold = Number(rule.params.threshold);
@@ -119,8 +132,8 @@ export function evaluateWinRate(walletId, username, winRateAll) {
     if (prev && prev !== state) {
       pushNotification({
         wallet: walletId, kind: 'winrate_cross',
-        message: `${username || walletId}'s all-time win rate crossed ${threshold}% (now ${pct.toFixed(1)}%).`,
-        meta: { ruleId: rule.id, direction: state },
+        message: `${username || walletId}'s prediction win rate crossed ${threshold}% (${pct.toFixed(1)}% over ${analyzed} completed prediction${analyzed === 1 ? '' : 's'}).`,
+        meta: { ruleId: rule.id, direction: state, analyzed },
       });
     }
     db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')

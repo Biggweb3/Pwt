@@ -4,12 +4,15 @@
  * Data honesty rules enforced here:
  *  - API-provided metrics (lb-api profit/volume, positions cashPnl) are labelled 'api'.
  *  - Metrics computed from stored rows are labelled 'calculated'.
- *  - Win rate is only derived from CLOSED positions (realizedPnl); open positions
- *    are never treated as wins or losses. If nothing closed in a window: N/A.
+ *  - WIN RATE never comes from P&L and never from a profile number: every win-rate
+ *    figure in the app is delegated to predictions.js (grouped positions classified
+ *    against authoritative market resolutions). Open/unresolved positions are excluded.
+ *  - TRADING P&L is a separate metric and is never blended into the win rate.
  *  - Missing data => null, rendered as "N/A" / "Unavailable" by the UI.
  */
 import { db } from './db.js';
 import { nowSec } from './util.js';
+import { computePredictionStats, profitabilityFromClosedPositions } from './predictions.js';
 
 export const PERIODS = {
   '24h': { label: 'Last 24 hours', seconds: 24 * 3600, lbWindow: '1d' },
@@ -21,6 +24,12 @@ export const PERIODS = {
 
 export const periodCutoff = (period, now = nowSec()) =>
   PERIODS[period]?.seconds ? now - PERIODS[period].seconds : null;
+
+/** Period cutoffs for every time window at once (used by the prediction stats). */
+export const periodCutoffs = (now = nowSec()) =>
+  Object.fromEntries(Object.entries(PERIODS)
+    .filter(([, p]) => p.seconds)
+    .map(([k, p]) => [k, now - p.seconds]));
 
 /** Trade-derived stats for one window (calculated). */
 export function tradeStatsForWindow(walletId, period) {
@@ -46,41 +55,59 @@ export function tradeStatsForWindow(walletId, period) {
 }
 
 /**
- * Win/loss stats from positions CLOSED inside the window (calculated).
- * A closed position is a win when realizedPnl > 0, a loss when < 0.
+ * Win/loss stats for one window, straight from the prediction engine (predictions.js).
+ * `winRate` is wins / (wins + losses) over *classified* predictions only; excluded
+ * records are counted separately and never enter the denominator.
  */
-export function winStatsForWindow(walletId, period) {
-  const cutoff = periodCutoff(period);
-  const rows = db.prepare(`
-    SELECT SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) wins,
-           SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END) losses,
-           SUM(CASE WHEN realized_pnl = 0 THEN 1 ELSE 0 END) flat,
-           SUM(realized_pnl) realized_pnl,
-           COUNT(*) closed
-    FROM closed_positions WHERE wallet = ? AND ts IS NOT NULL ${cutoff ? 'AND ts >= ?' : ''}`)
-    .get(...(cutoff ? [walletId, cutoff] : [walletId]));
-  const wins = rows.wins || 0;
-  const losses = rows.losses || 0;
-  const decided = wins + losses;
+export function winStatsForWindow(walletId, period, predictions = null) {
+  const key = period === 'all' ? 'all' : period;
+  const stats = predictions || computePredictionStats(walletId, { periods: { [key]: periodCutoff(period) } });
+  const p = stats.periods[key] || { analyzed: 0, wins: 0, losses: 0, excluded: 0, scanned: 0, winRate: null };
+  const primary = stats.primary;
   return {
-    closedInWindow: rows.closed || 0,
-    wins,
-    losses,
-    flat: rows.flat || 0,
-    winRate: decided > 0 ? wins / decided : null,   // null => N/A (nothing decided in window)
-    realizedPnl: rows.realized_pnl ?? null,
+    basis: 'prediction',   // vs 'profitability': how this number was derived, always stated
+    analyzed: p.analyzed,
+    wins: p.wins,
+    losses: p.losses,
+    excluded: p.excluded,
+    completedInWindow: p.scanned,
+    winRate: p.winRate,
+    sampleSize: p.analyzed,
+    window: primary.window,
+    windowAnalyzed: primary.analyzed,
+    windowWinRate: primary.winRate,
+    windowLimited: primary.limited,
+    windowLabel: primary.label,
+    openExcluded: stats.exclusions.openPositions,
+    undeterminedAll: stats.totals.undetermined,
+    basisLabel: p.analyzed
+      ? `${p.wins}W / ${p.losses}L of ${p.analyzed} completed predictions${p.excluded ? ` · ${p.excluded} excluded` : ''}`
+      : 'No completed, resolved predictions in this window',
   };
+}
+
+/**
+ * PROFITABILITY (not a win rate): share of closed positions whose realized P&L was
+ * positive. Kept only so the UI can show, side by side, what Polymarket's own
+ * position data would imply — and why it is not the same thing as being right.
+ */
+export function profitabilityForWindow(walletId, period) {
+  const cutoff = periodCutoff(period);
+  const row = profitabilityFromClosedPositions(walletId, cutoff);
+  return { ...row, period };
 }
 
 /** Position counts (API-provided snapshots). */
 export function positionCounts(walletId) {
   const active = db.prepare('SELECT COUNT(*) c, SUM(current_value) v, SUM(cash_pnl) p FROM positions WHERE wallet = ?').get(walletId);
   const closed = db.prepare('SELECT COUNT(*) c FROM closed_positions WHERE wallet = ?').get(walletId);
+  const redeemable = db.prepare('SELECT COUNT(*) c FROM positions WHERE wallet = ? AND redeemable = 1').get(walletId);
   return {
     activePositions: active.c || 0,
     openValue: active.v ?? null,
     openUnrealizedPnl: active.p ?? null,
     closedPositions: closed.c || 0,
+    redeemablePositions: redeemable.c || 0,
   };
 }
 
@@ -105,6 +132,29 @@ export function pnlSeries(walletId, { minTs = null, maxPoints = 400 } = {}) {
   return { kind: 'pnl', points: downsample(pts, maxPoints) };
 }
 
+/**
+ * Win/loss sequence for the accuracy chart: newest-first completed predictions turned
+ * into a chronological +1 / -1 series (independent of P&L by construction).
+ */
+export function winRateSeries(walletId, { window = 20, minTs = null } = {}) {
+  const rows = db.prepare(`
+    SELECT completed_at, result, total_pnl FROM predictions
+    WHERE wallet = ? AND status = 'COMPLETED' AND result IN ('WIN','LOSS') AND completed_at IS NOT NULL
+      ${minTs ? 'AND completed_at >= ?' : ''}
+    ORDER BY completed_at ASC`).all(...(minTs ? [walletId, minTs] : [walletId]));
+  if (rows.length < 2) return { kind: 'accuracy', window, points: [] };
+  const out = [];
+  let wins = 0; let pnl = 0;
+  for (let i = 0; i < rows.length; i++) {
+    wins += rows[i].result === 'WIN' ? 1 : 0;
+    pnl += rows[i].total_pnl || 0;
+    if (i >= window) { wins -= rows[i - window].result === 'WIN' ? 1 : 0; pnl -= rows[i - window].total_pnl || 0; }
+    const n = Math.min(i + 1, window);
+    out.push({ ts: rows[i].completed_at, accuracy: wins / n, pnl, sample: n });
+  }
+  return { kind: 'accuracy', window, points: out };
+}
+
 function downsample(pts, maxPoints) {
   if (pts.length <= maxPoints) return pts;
   const step = Math.ceil(pts.length / maxPoints);
@@ -116,11 +166,23 @@ function downsample(pts, maxPoints) {
 
 /** Full window summary used by the trader detail page. */
 export function windowSummary(walletId, period) {
+  const cutoff = periodCutoff(period);
+  const key = period === 'all' ? 'all' : period;
+  const predictions = computePredictionStats(walletId, { periods: { [key]: cutoff } });
   return {
     period,
+    periodLabel: PERIODS[period]?.label || period,
     trades: tradeStatsForWindow(walletId, period),
-    win: winStatsForWindow(walletId, period),
+    win: winStatsForWindow(walletId, period, predictions),
+    predictions,
+    profitability: profitabilityForWindow(walletId, period),
     positions: positionCounts(walletId),
+    pnl: {
+      realized: db.prepare('SELECT SUM(realized_pnl) v FROM closed_positions WHERE wallet = ?' + (cutoff ? ' AND ts >= ?' : ''))
+        .get(...(cutoff ? [walletId, cutoff] : [walletId]))?.v ?? null,
+      fromPredictions: db.prepare(`SELECT SUM(total_pnl) v FROM predictions WHERE wallet = ? AND status = 'COMPLETED'` + (cutoff ? ' AND completed_at >= ?' : ''))
+        .get(...(cutoff ? [walletId, cutoff] : [walletId]))?.v ?? null,
+    },
   };
 }
 
@@ -132,9 +194,11 @@ export function computeDashboardStats(walletId, apiStats = null) {
   const firstTrade = db.prepare('SELECT ts FROM trades WHERE wallet = ? ORDER BY ts ASC LIMIT 1').get(walletId);
   const counts = positionCounts(walletId);
   const t24 = tradeStatsForWindow(walletId, '24h');
-  const w24 = winStatsForWindow(walletId, '24h');
   const t7d = tradeStatsForWindow(walletId, '7d');
-  const wAll = winStatsForWindow(walletId, 'all');
+  const predictions = computePredictionStats(walletId, { now, periods: periodCutoffs(now) });
+  const walletRow = db.prepare('SELECT closed_history_complete, positions_scan_complete FROM wallets WHERE id = ?').get(walletId);
+  predictions.coverage.closedHistoryComplete = !!walletRow?.closed_history_complete;
+  predictions.coverage.positionsScanComplete = walletRow?.positions_scan_complete !== 0;
   return {
     computedAt: now,
     lastActivityTs: Math.max(lastTrade?.ts || 0, lastActivity?.ts || 0) || null,
@@ -142,15 +206,19 @@ export function computeDashboardStats(walletId, apiStats = null) {
     firstObservedTs: firstTrade?.ts || null,
     trades24h: t24.trades,
     volume24h: t24.volume,
-    winRate24h: w24.winRate,
     trades7d: t7d.trades,
     volume7d: t7d.volume,
-    winRateAll: wAll.winRate,
-    closedAll: wAll.closedInWindow,
     activePositions: counts.activePositions,
     openValue: counts.openValue,
     openUnrealizedPnl: counts.openUnrealizedPnl,
     closedPositions: counts.closedPositions,
+    redeemablePositions: counts.redeemablePositions,
+    // Everything about win rate lives in this block — one engine, one definition.
+    predictions,
+    // Legacy convenience fields (same values as the engine, no second calculation).
+    winRateAll: predictions.totals.winRate,
+    winRate24h: predictions.periods['24h']?.winRate ?? null,
+    closedAll: predictions.totals.completed,
     api: apiStats || null, // {pnl:{'1d','7d','30d','all'}, volume:{...}, value, marketsTraded}
   };
 }
