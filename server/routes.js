@@ -11,7 +11,7 @@ import { computePredictionStats, calculateTraderWinRate, rebuildPredictions, res
 import { syncWalletNow, syncDueWallets } from './syncEngine.js';
 import { sseHandler, broadcast } from './events.js';
 import { claimJobs, resolveJob, noteBridgeClientSeen, bridgeInUse, pendingJobCount } from './bridge.js';
-import { listRules, addRule, setRuleEnabled, deleteRule } from './alerts.js';
+import { listRules, addRule, setRuleEnabled, updateRuleParams, deleteRule } from './alerts.js';
 import { parseTraderInput, normalizeAddress, clampInt, nowSec } from './util.js';
 import { transportGet, qs } from './transport.js';
 
@@ -593,8 +593,13 @@ api.post('/alerts/rules', (req, res) => {
   }
 });
 api.patch('/alerts/rules/:id', (req, res) => {
-  setRuleEnabled(parseInt(req.params.id, 10), !!req.body?.enabled);
-  res.json({ ok: true });
+  const id = parseInt(req.params.id, 10);
+  const body = req.body || {};
+  // Only touch what the caller actually sent, so editing a threshold never silently
+  // disables the rule (and toggling never wipes its parameters).
+  if ('enabled' in body) setRuleEnabled(id, !!body.enabled);
+  const rule = 'params' in body ? updateRuleParams(id, body.params || {}) : null;
+  res.json({ ok: true, rule: rule || undefined });
 });
 api.delete('/alerts/rules/:id', (req, res) => {
   deleteRule(parseInt(req.params.id, 10));

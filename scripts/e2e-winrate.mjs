@@ -287,6 +287,35 @@ try {
   ok('search endpoint still works', (await get('/api/search?q=marla')).status === 200);
   ok('alerts endpoints still work', (await get('/api/alerts/rules')).status === 200);
   ok('static client served', (await get('/')).status === 200);
+
+  console.log('\n[14] the win-rate alert reports the new metric — with its sample size');
+  const rule = await get('/api/alerts/rules', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'winrate_cross', wallet: MARLA, params: { threshold: 90 } }),
+  });
+  eq('win-rate alert rule created', 201, rule.status);
+  const ruleId = rule.json?.rule?.id;
+  // Let one poll cycle record the current state (63% is below 90%) before lowering the
+  // threshold — a cross is only meaningful against a previously recorded state.
+  const before = await get(`/api/wallets/${MARLA}`);
+  eq('trader is live before the alert check', 'live', before.json?.wallet?.status);
+  await sleep(9000);
+  const edited = await get(`/api/alerts/rules/${ruleId}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ params: { threshold: 60 } }),
+  });
+  eq('editing the threshold keeps the rule enabled', 1, edited.json?.rule?.enabled);
+  near('editing the threshold stores the new value', 60, Number(edited.json?.rule?.params?.threshold));
+  const crossed = await waitFor('win-rate crossing notification', async () => {
+    const n = await get('/api/notifications');
+    const hit = (n.json?.notifications || []).find((x) => x.kind === 'winrate_cross');
+    return hit || null;
+  }, { timeoutMs: 45000, everyMs: 1500 }).catch(() => null);
+  ok('a win-rate alert fired after the trader crossed it', !!crossed, 'no notification within 45s (poll cadence?)');
+  if (crossed) {
+    ok('the alert message states the sample size', /63%|63\.0%/.test(crossed.message) && /100 completed predictions/.test(crossed.message), crossed.message);
+    eq('the alert payload carries the analysed count', 100, crossed.meta?.analyzed);
+  }
+  await get(`/api/alerts/rules/${ruleId}`, { method: 'DELETE' });
 } catch (err) {
   failures.push(`unexpected error: ${err?.stack || err}`);
   console.log(`\n  ✗ ${err?.stack || err}`);

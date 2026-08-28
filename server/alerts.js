@@ -33,6 +33,14 @@ export function addRule({ kind, wallet = null, params = {} }) {
   return db.prepare('SELECT * FROM alert_rules WHERE id = ?').get(info.lastInsertRowid);
 }
 
+/** Replace a rule's parameters (e.g. moving a win-rate threshold) without touching
+ * its enabled state — the alert that reports the win rate must stay editable. */
+export function updateRuleParams(id, params) {
+  db.prepare('UPDATE alert_rules SET params = ? WHERE id = ?').run(JSON.stringify(params || {}), id);
+  const row = db.prepare('SELECT * FROM alert_rules WHERE id = ?').get(id);
+  return row ? { ...row, params: row.params ? JSON.parse(row.params) : {} } : null;
+}
+
 export const setRuleEnabled = (id, enabled) =>
   db.prepare('UPDATE alert_rules SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
 export const deleteRule = (id) => db.prepare('DELETE FROM alert_rules WHERE id = ?').run(id);
