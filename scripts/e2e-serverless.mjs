@@ -31,9 +31,14 @@ const serveOnly = args.includes('--serve-only');
 process.env.VERCEL = '1';
 process.env.DATA_DIR = process.env.DATA_DIR || `/tmp/pwt-e2e-${Date.now()}`;
 if (useMock) {
-  process.env.POLYMARKET_DATA_API = 'http://127.0.0.1:3200';
-  process.env.POLYMARKET_GAMMA_API = 'http://127.0.0.1:3200';
-  process.env.POLYMARKET_LB_API = 'http://127.0.0.1:3200';
+  const mock = 'http://127.0.0.1:3200';
+  process.env.POLYMARKET_DATA_API = mock;
+  process.env.POLYMARKET_GAMMA_API = mock;
+  process.env.POLYMARKET_LB_API = mock;
+  // market resolutions (WIN/LOSS authority) come from the same mock
+  process.env.POLYMARKET_CLOB_API = mock;
+  process.env.RESOLUTION_LOOKUPS_INITIAL = '4000';
+  process.env.RESOLUTION_LOOKUPS_PER_CYCLE = '4000';
 }
 const DATA_API = process.env.POLYMARKET_DATA_API || 'https://data-api.polymarket.com';
 
@@ -138,6 +143,43 @@ try {
     ok(sugg.status === 200, `GET suggestions (${s.status})`);
     const srch = await req('GET', `/api/search?q=${address.slice(0, 8)}`);
     ok(srch.status === 200 && srch.json?.traders?.length > 0, `GET search finds trader (${srch.status})`);
+  }
+
+  // ------------------------------------- win rate inside a serverless request
+  // The synthetic mock wallet has a KNOWN answer (63 wins / 37 losses over its most
+  // recent 100 completed predictions), so this proves the whole engine works in the
+  // deployment Vercel actually runs — where there is no background poller.
+  if (useMock) {
+    console.log('\n[e2e] serverless win-rate engine (ground-truth wallet)…');
+    const marla = `0x${'a'.repeat(39)}1`;
+    const add = await req('POST', '/api/wallets', { input: `https://polymarket.com/profile/${marla}` });
+    ok(add.status === 201, `ground-truth trader added (${add.status})`);
+    let wr = null;
+    for (let i = 0; i < 10; i++) {
+      wr = await req('GET', `/api/wallets/${marla}/win-rate`);
+      if ((wr.json?.stats?.primary?.analyzed ?? 0) >= 100) break;
+      await req('POST', '/api/sync', {});
+      await wait(800);
+    }
+    const prim = wr.json?.stats?.primary;
+    ok(prim?.analyzed === 100, `100 completed predictions classified (${prim?.analyzed})`);
+    ok(prim?.wins === 63 && prim?.losses === 37, `63W / 37L from market resolutions (${prim?.wins}W/${prim?.losses}L)`);
+    ok(prim?.winRate === 0.63, `win rate is exactly 63% (${prim?.winRate})`);
+    ok(wr.json?.methodology?.tooltip?.startsWith('Win rate is independently calculated'), 'methodology + tooltip shipped with the payload');
+    ok(wr.json?.comparison?.profitabilityCrossCheck?.rate === 1 && prim?.winRate === 0.63, 'profitability (100%) kept separate from accuracy (63%)');
+    ok(wr.json?.comparison?.polymarketReported?.winRate === null, 'no fabricated Polymarket-reported win rate');
+    ok(wr.json?.stats?.exclusions?.openPositions > 0, `open positions excluded (${wr.json?.stats?.exclusions?.openPositions})`);
+    const wins10 = await req('GET', `/api/wallets/${marla}/predictions?window=10&result=WIN`);
+    ok(wins10.json?.total === 6, `audit table: 6 wins inside the last-10 window (${wins10.json?.total})`);
+    const detail = await req('GET', `/api/wallets/${marla}/predictions/${encodeURIComponent('0xAAAA0003')}`);
+    ok(detail.status === 200 && detail.json?.transactions?.length === 8, `audit detail groups 8 fills into one prediction (${detail.json?.transactions?.length})`);
+    const cmp2 = await req('GET', '/api/compare');
+    const row = (cmp2.json?.rows || []).find((x) => x.address === marla);
+    ok(row?.winRate === 0.63 && row?.winRateAnalyzed === 100, 'compare table uses the same engine (63%, n=100)');
+    const cached = await req('POST', `/api/wallets/${marla}/predictions/rebuild`, {});
+    ok(cached.status === 200 && cached.json?.primary?.winRate === 0.63, `rebuild is stable (${cached.json?.primary?.winRate})`);
+    const d2 = await req('DELETE', `/api/wallets/${marla}`);
+    ok(d2.status === 200, 'ground-truth trader removed again');
   }
 
   // --------------------------------------------------- serverless behaviours

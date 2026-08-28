@@ -5,7 +5,10 @@ import { untrackLocal } from '../lib/tracked';
 import { useStore, useNow } from '../lib/store';
 import { Avatar, Metric, Panel, SideBadge, OutcomeBadge, StatusPill, TypeBadge, UpdatedAgo, Spinner, EmptyState, ErrorState } from '../components/ui';
 import { PerfChart } from '../components/PerfChart';
-import { money, signedMoney, pct, num, shares, price, timeAgo, exactTime, displayName, shortAddr, PERIOD_LABELS, isNum } from '../lib/format';
+import { PredictionsPanel } from '../components/PredictionsPanel';
+import { InfoTip, WinRateValue, WINRATE_TOOLTIP } from '../components/WinRate';
+import { WinRateComparison } from '../components/WinRateComparison';
+import { money, signedMoney, pct, ratePct, num, shares, price, timeAgo, exactTime, displayName, shortAddr, PERIOD_LABELS, isNum } from '../lib/format';
 import type { ActivityRow, ClosedPosition, Position, Trade, Wallet, WalletStats, WindowSummary } from '../lib/types';
 
 const PERIOD_SECONDS: Record<string, number | null> = { '24h': 86400, '72h': 259200, '7d': 604800, '30d': 2592000, all: null };
@@ -23,6 +26,8 @@ export function TraderPage() {
   const [period, setPeriod] = useState('7d');
   const [summary, setSummary] = useState<WindowSummary | null>(null);
   const [chart, setChart] = useState<{ kind: 'pnl' | 'volume'; points: { ts: number; v: number }[] } | null>(null);
+  const [accuracy, setAccuracy] = useState<{ points: { ts: number; accuracy: number; pnl: number; sample: number }[] } | null>(null);
+  const [chartMode, setChartMode] = useState<'pnl' | 'accuracy'>('pnl');
   const [removing, setRemoving] = useState(false);
 
   const load = useCallback(async () => {
@@ -43,6 +48,8 @@ export function TraderPage() {
   useEffect(() => {
     apiFetch<WindowSummary>(`/api/wallets/${address}/summary/${period}`).then(setSummary).catch(() => setSummary(null));
     apiFetch<{ kind: 'pnl' | 'volume'; points: { ts: number; v: number }[] }>(`/api/wallets/${address}/chart?period=${period}`).then(setChart).catch(() => setChart(null));
+    apiFetch<{ points: { ts: number; accuracy: number; pnl: number; sample: number }[] }>(`/api/wallets/${address}/accuracy?period=${period}&window=20`)
+      .then((r) => setAccuracy(r)).catch(() => setAccuracy(null));
   }, [address, period]);
 
   const remove = async () => {
@@ -102,27 +109,51 @@ export function TraderPage() {
             {label}
           </button>
         ))}
-        <span className="ml-auto text-2xs text-slate-600 hidden sm:block">
-          win rate derived from positions closed in period · open positions never counted as wins/losses
+        <span className="ml-auto text-2xs text-slate-600 hidden sm:block" title={WINRATE_TOOLTIP}>
+          win rate = completed predictions that resolved in the trader’s favour · open and unresolved positions are never counted
         </span>
       </div>
 
       {/* ---------------------------------------------------- metrics ----- */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-px bg-line border border-line rounded-md overflow-hidden">
         <Cell>
-          <Metric label="Win Rate" value={summary ? pct(summary.win.winRate) : '…'} tone={summary?.win.winRate == null ? 'muted' : summary.win.winRate >= 0.5 ? 'gain' : 'loss'} source="calculated"
-            sub={summary ? `${summary.win.wins}W / ${summary.win.losses}L${summary.win.flat ? ` / ${summary.win.flat} flat` : ''}` : ''} />
+          <div className="flex items-center gap-1.5 text-2xs uppercase tracking-[0.12em] text-slate-500">
+            Win Rate <span className="text-slate-600">· {PERIOD_LABELS[period]}</span> <InfoTip />
+          </div>
+          {summary ? (
+            <>
+              <div className={`font-mono text-lg leading-6 tabular-nums ${summary.win.winRate == null ? 'text-slate-500' : summary.win.winRate >= 0.5 ? 'text-gain' : 'text-loss'}`}>
+                {summary.win.winRate == null ? 'N/A' : ratePct(summary.win.winRate)}
+              </div>
+              <div className="text-2xs text-slate-500 truncate" title={summary.win.basisLabel}>
+                {summary.win.wins}W / {summary.win.losses}L · {summary.win.analyzed} completed
+              </div>
+            </>
+          ) : <div className="font-mono text-lg text-slate-600">…</div>}
+        </Cell>
+        <Cell>
+          <div className="text-2xs uppercase tracking-[0.12em] text-slate-500 flex items-center gap-1.5">Win Rate · Last 100 <InfoTip /></div>
+          <WinRateValue win={overview?.predictions?.primary} size="md" info={false} />
         </Cell>
         <Cell><Metric label="Trades" value={summary ? num(summary.trades.trades) : '…'} source="synced" sub={summary ? `${summary.trades.buys} buys · ${summary.trades.sells} sells` : ''} /></Cell>
         <Cell><Metric label="Volume" value={summary ? money(summary.apiVolume ?? summary.trades.volume) : '…'} source={summary?.apiVolume != null ? 'api' : 'calculated'} /></Cell>
         <Cell>
-          <Metric label="Realized P&L" value={summary ? (isNum(summary.apiPnl) ? signedMoney(summary.apiPnl) : signedMoney(summary.win.realizedPnl)) : '…'}
-            tone={summary && isNum(summary.apiPnl ?? summary.win.realizedPnl) ? ((summary.apiPnl ?? summary.win.realizedPnl)! >= 0 ? 'gain' : 'loss') : 'muted'}
-            source={summary?.apiPnl != null ? 'api' : 'calculated'} />
+          <Metric label="Trading P&L" value={summary ? (isNum(summary.apiPnl) ? signedMoney(summary.apiPnl) : signedMoney(summary.pnl?.realized ?? null)) : '…'}
+            tone={summary && isNum(summary.apiPnl ?? summary.pnl?.realized) ? ((summary.apiPnl ?? summary.pnl?.realized)! >= 0 ? 'gain' : 'loss') : 'muted'}
+            source={summary?.apiPnl != null ? 'api' : 'calculated'}
+            sub={summary?.pnl?.fromPredictions != null ? `${signedMoney(summary.pnl.fromPredictions)} from completed predictions` : undefined} />
         </Cell>
-        <Cell><Metric label="Active Positions" value={summary ? num(summary.positions.activePositions) : '…'} source="api" sub={summary?.positions.openValue != null ? `${money(summary.positions.openValue)} open value` : undefined} /></Cell>
-        <Cell><Metric label="Resolved Positions" value={summary ? num(summary.win.closedInWindow) : '…'} source="api" sub="closed in period" /></Cell>
+        <Cell>
+          <Metric label="Completed Predictions" value={summary ? num(summary.win.completedInWindow) : '…'} source="calculated"
+            sub={summary ? `${num(summary.positions.activePositions)} open · ${num(summary.positions.closedPositions)} closed` : undefined} />
+        </Cell>
       </div>
+
+      {/* ------------------------------------------- reported vs calculated --- */}
+      <WinRateComparison address={address} stats={overview?.predictions ?? null} updatedAt={wallet.lastSuccessAt} />
+
+      {/* ------------------------------------------------------- predictions - */}
+      <PredictionsPanel address={address} stats={overview?.predictions ?? null} updatedAt={wallet.lastSuccessAt} />
 
       {/* ------------------------------------------------- extra stats ---- */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-line border border-line rounded-md overflow-hidden">
@@ -137,8 +168,23 @@ export function TraderPage() {
       </div>
 
       {/* ------------------------------------------------------- chart ---- */}
-      <Panel title="Performance" right={<span className="text-2xs text-slate-500">{PERIOD_LABELS[period]}</span>}>
-        {chart ? <PerfChart points={chart.points} kind={chart.kind} /> : <div className="h-[180px] grid place-items-center"><Spinner /></div>}
+      <Panel title={chartMode === 'pnl' ? 'Performance — trading P&L' : 'Performance — prediction accuracy'}
+        right={
+          <div className="flex items-center gap-1.5">
+            {(['pnl', 'accuracy'] as const).map((m) => (
+              <button key={m} onClick={() => setChartMode(m)}
+                className={`px-2 py-0.5 text-2xs font-semibold rounded border ${chartMode === m ? 'bg-accent/15 border-accent/40 text-accent' : 'border-line text-slate-500 hover:text-slate-300'}`}>
+                {m === 'pnl' ? 'P&L' : 'ACCURACY'}
+              </button>
+            ))}
+            <span className="text-2xs text-slate-500">{PERIOD_LABELS[period]}</span>
+          </div>
+        }>
+        {chartMode === 'accuracy'
+          ? (accuracy && accuracy.points.length > 1
+            ? <AccuracyChart points={accuracy.points} />
+            : <div className="h-[180px] grid place-items-center text-xs text-slate-600 border border-dashed border-line rounded">Need at least 2 classified predictions to chart accuracy.</div>)
+          : chart ? <PerfChart points={chart.points} kind={chart.kind} /> : <div className="h-[180px] grid place-items-center"><Spinner /></div>}
       </Panel>
 
       <div className="grid xl:grid-cols-2 gap-4 items-start">
@@ -405,5 +451,31 @@ function TradesPanel({ address }: { address: string }) {
         </>
       )}
     </Panel>
+  );
+}
+
+/** Rolling hit-rate over completed predictions (20-prediction window), money-free. */
+function AccuracyChart({ points }: { points: { ts: number; accuracy: number; pnl: number; sample: number }[] }) {
+  const W = 800, H = 180, PAD = { l: 8, r: 8, t: 12, b: 18 };
+  const x = (i: number) => PAD.l + (i / Math.max(1, points.length - 1)) * (W - PAD.l - PAD.r);
+  const y = (v: number) => PAD.t + (1 - v) * (H - PAD.t - PAD.b);
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.accuracy).toFixed(1)}`).join(' ');
+  const last = points[points.length - 1];
+  return (
+    <div className="relative">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: H }}>
+        {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+          <g key={f}>
+            <line x1={PAD.l} x2={W - PAD.r} y1={y(f)} y2={y(f)} stroke={f === 0.5 ? '#334155' : '#1c2636'} strokeWidth="1" strokeDasharray={f === 0.5 ? undefined : '3 5'} />
+            <text x={PAD.l + 2} y={y(f) - 3} fill="#475569" fontSize="9">{Math.round(f * 100)}%</text>
+          </g>
+        ))}
+        <path d={line} fill="none" stroke={last.accuracy >= 0.5 ? '#34d399' : '#f87171'} strokeWidth="1.8" strokeLinejoin="round" />
+        <circle cx={x(points.length - 1)} cy={y(last.accuracy)} r="3" fill={last.accuracy >= 0.5 ? '#34d399' : '#f87171'} />
+      </svg>
+      <div className="absolute top-1 left-1/2 -translate-x-1/2 text-2xs text-slate-500 pointer-events-none">
+        rolling 20-prediction hit rate — latest {ratePct(last.accuracy)} ({last.sample} predictions)
+      </div>
+    </div>
   );
 }

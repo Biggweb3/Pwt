@@ -81,3 +81,19 @@ export function displayName(w: { username?: string | null; pseudonym?: string | 
 export const PERIOD_LABELS: Record<string, string> = {
   '24h': '24H', '72h': '72H', '7d': '7D', '30d': '30D', all: 'ALL',
 };
+
+/**
+ * Win rates are shown with at most 2 decimals and no padding zeros, so 63% reads as
+ * "63%" while 69.05% keeps its precision (spec: 63%, 69.05%, 66.67%).
+ */
+export function ratePct(v: number | null | undefined): string {
+  if (!isNum(v)) return 'N/A';
+  const s = (v * 100).toFixed(2).replace(/\.?0+$/, '');
+  return `${s === '' ? '0' : s}%`;
+}
+
+/** "63 / 100" style sample sizes — always rendered next to a win rate. */
+export function sampleText(wins: number | null | undefined, analyzed: number | null | undefined): string {
+  if (!isNum(wins) || !isNum(analyzed)) return '';
+  return `${wins} / ${analyzed}`;
+}

@@ -43,8 +43,26 @@ export const config = {
     data: process.env.POLYMARKET_DATA_API || 'https://data-api.polymarket.com',
     gamma: process.env.POLYMARKET_GAMMA_API || 'https://gamma-api.polymarket.com',
     lb: process.env.POLYMARKET_LB_API || 'https://lb-api.polymarket.com',
+    // CLOB market endpoint is the authoritative source for "has this market
+    // resolved, and which outcome token won" (tokens[].winner).
+    clob: process.env.POLYMARKET_CLOB_API || 'https://clob.polymarket.com',
   },
   profileBase: 'https://polymarket.com/profile/',
+  // ---- prediction (win-rate) engine -------------------------------------------------
+  // How many completed-position records one wallet is classified from, and how many
+  // open positions are scanned (paged, 500/page) when rebuilding predictions.
+  predictionClosedPositions: int(process.env.PREDICTION_CLOSED_LIMIT, 1500),
+  predictionPositionPages: int(process.env.PREDICTION_POSITION_PAGES, 4),
+  // Market-resolution lookups are cached forever in `market_resolutions`; these only
+  // bound how much new lookup work a single sync cycle may do (bridge mode included).
+  resolutionLookupsPerCycle: int(process.env.RESOLUTION_LOOKUPS_PER_CYCLE, 40),
+  resolutionLookupsInitial: int(process.env.RESOLUTION_LOOKUPS_INITIAL, 160),
+  resolutionConcurrency: 6,
+  resolutionRetrySec: int(process.env.RESOLUTION_RETRY_SEC, 300),   // retry open markets after this
+  resolutionMaxAttempts: 12,                                        // then stop hammering, mark unreachable
+  // Second-opinion thresholds: a position is only classified when the market itself
+  // resolved; `curPrice` inside this band means the market is still trading.
+  pinnedEpsilon: 0.005,
   defaultPollInterval: Math.min(Math.max(int(process.env.POLL_INTERVAL, 30), 5), 300),
   initialHistoryDays: int(process.env.INITIAL_HISTORY_DAYS, 31),
   initialMaxTrades: int(process.env.INITIAL_MAX_TRADES, 2500),
@@ -55,7 +73,7 @@ export const config = {
   positionsRefreshEvery: 4,     // refresh positions every N sync cycles
   closedRefreshEvery: 8,        // refresh closed positions every N cycles
   statsRefreshEvery: 10,        // refresh lb-api stats every N cycles
-  maxClosedPositions: 1000,     // backfill cap for closed positions
+  maxClosedPositions: 1500,     // backfill cap for closed positions
   bridgeJobTimeoutMs: 60000,    // unclaimed bridge jobs expire after this
   // Overall wall-clock budget for an initial sync when it must complete inside
   // one request (serverless). Generous history is traded for convergence.

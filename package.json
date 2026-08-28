@@ -3,14 +3,24 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Polymarket Wallet Intelligence Dashboard — monitor and compare public Polymarket traders from one terminal.",
-  "engines": { "node": ">=22.5" },
+  "description": "Polymarket Wallet Intelligence Dashboard \u2014 monitor and compare public Polymarket traders from one terminal.",
+  "engines": {
+    "node": ">=22.5"
+  },
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
     "build": "npm --prefix client run build",
     "dev:client": "npm --prefix client run dev",
-    "build:vercel-api": "node scripts/build-vercel-api.mjs"
+    "build:vercel-api": "node scripts/build-vercel-api.mjs",
+    "typecheck": "npm --prefix client run typecheck",
+    "test": "node scripts/test-winrate.mjs && node scripts/test-render.mjs && node scripts/e2e-winrate.mjs",
+    "test:winrate": "node scripts/test-winrate.mjs",
+    "test:render": "node scripts/test-render.mjs",
+    "test:e2e": "node scripts/e2e-winrate.mjs",
+    "test:serverless": "node scripts/mock-polymarket.mjs 3200 & sleep 1; node scripts/e2e-serverless.mjs client/api/index.js 3300 --mock; kill %1",
+    "test:live": "node scripts/e2e-live.mjs",
+    "mock": "node scripts/mock-polymarket.mjs"
   },
   "dependencies": {
     "express": "^5.2.0"
